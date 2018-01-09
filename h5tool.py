@@ -617,6 +617,127 @@ def create_celeba_hq(h5_filename, celeba_dir, delta_dir, num_threads=4, num_task
 
 #----------------------------------------------------------------------------
 
+def create_dataset(dataset_dir, model, images_dir, landmarks_txt, out_dir, num_gpu=0, num_threads=4, num_tasks=100):
+    print 'Loading Megaface data from %s' % dataset_dir
+    with open(os.path.join(dataset_dir, landmarks_txt), 'rt') as file:
+        files_landmarks = [(line.split()[0], [float(value) for value in line.split()[1:]]) for line in file.readlines()[2:]]
+        files = [e[0] for e in files_landmarks]
+        landmarks = [e[1] for e in files_landmarks]
+        landmarks = np.float32(landmarks).reshape(-1, 5, 2)
+
+    import torch
+    from torch.autograd import Variable
+    from lapsrn_wgan import Net2x, Net4x
+    torch.cuda.set_device(num_gpu)
+
+    model8x = torch.load(model, map_location=lambda st, loc: st.cuda(num_gpu))['model']
+    model8x = model8x.cuda()
+    model4x = Net4x()
+    model4x.load_state_dict(model8x.state_dict())
+    model4x = model4x.cuda()
+    model2x = Net2x()
+    model2x.load_state_dict(model8x.state_dict())
+    model2x = model2x.cuda()
+
+    basesize = 1024
+
+    def rot90(v):
+        return np.array([-v[1], v[0]])
+
+    def process_func(idx):
+        # Load original image.
+        if any([os.path.isfile(os.path.join(dataset_dir, out_dir, nx + 'x', os.path.basename(files[idx]))) for nx in ['1', '2', '4', '8']]):
+            return idx, None, None
+
+        orig_path = os.path.join(dataset_dir, images_dir, files[idx])
+        img = PIL.Image.open(orig_path)
+
+        # Choose oriented crop rectangle.
+        lm = landmarks[idx]
+        eye_avg = (lm[0] + lm[1]) * 0.5 + 0.5
+        mouth_avg = (lm[3] + lm[4]) * 0.5 + 0.5
+        eye_to_eye = lm[1] - lm[0]
+        eye_to_mouth = mouth_avg - eye_avg
+        x = eye_to_eye - rot90(eye_to_mouth)
+        x /= np.hypot(*x)
+        x *= max(np.hypot(*eye_to_eye) * 2.0, np.hypot(*eye_to_mouth) * 1.8)
+        y = rot90(x)
+        c = eye_avg + eye_to_mouth * 0.1
+        quad = np.stack([c - x - y, c - x + y, c + x + y, c + x - y])
+        zoom = basesize / (np.hypot(*x) * 2)
+
+        # Shrink.
+        shrink = int(np.floor(0.5 / zoom))
+        if shrink > 1:
+            size = (int(np.round(float(img.size[0]) / shrink)), int(np.round(float(img.size[1]) / shrink)))
+            img = img.resize(size, PIL.Image.ANTIALIAS)
+            quad /= shrink
+            zoom *= shrink
+
+        # Crop.
+        border = max(int(np.round(basesize * 0.1 / zoom)), 3)
+        crop = (int(np.floor(min(quad[:,0]))), int(np.floor(min(quad[:,1]))), int(np.ceil(max(quad[:,0]))), int(np.ceil(max(quad[:,1]))))
+        crop = (max(crop[0] - border, 0), max(crop[1] - border, 0), min(crop[2] + border, img.size[0]), min(crop[3] + border, img.size[1]))
+        if crop[2] - crop[0] < img.size[0] or crop[3] - crop[1] < img.size[1]:
+            img = img.crop(crop)
+            quad -= crop[0:2]
+
+        # Simulate super-resolution.
+        superres = int(np.exp2(np.ceil(np.log2(zoom))))
+        if superres > 1:
+            if superres == 8 or superres == 4 or superres == 2:
+                input_img_th = np.asarray(img).transpose(2, 0, 1)
+                input_img_th = Variable(torch.from_numpy(input_img_th).float(), volatile=True).view(1, input_img_th.shape[0], input_img_th.shape[1], input_img_th.shape[2])
+                with torch.cuda.device(num_gpu):
+                    input_img_th = input_img_th.cuda()
+                    HR = model2x(input_img_th) if superres == 2 else model4x(input_img_th)[1] if superres == 4 else model8x(input_img_th)[2]
+                HR = HR.cpu().data[0].numpy()
+                img = HR.transpose(1, 2, 0)
+                img = PIL.Image.fromarray(np.uint8(np.clip(np.round(img), 0, 255)), 'RGB')
+            else:
+                return idx, None, None
+
+            quad *= superres
+            zoom /= superres
+
+        # Pad.
+        pad = (int(np.floor(min(quad[:,0]))), int(np.floor(min(quad[:,1]))), int(np.ceil(max(quad[:,0]))), int(np.ceil(max(quad[:,1]))))
+        pad = (max(-pad[0] + border, 0), max(-pad[1] + border, 0), max(pad[2] - img.size[0] + border, 0), max(pad[3] - img.size[1] + border, 0))
+        if max(pad) > border - 4:
+            pad = np.maximum(pad, int(np.round(basesize * 0.3 / zoom)))
+            img = np.pad(np.float32(img), ((pad[1], pad[3]), (pad[0], pad[2]), (0, 0)), 'reflect')
+            h, w, _ = img.shape
+            y, x, _ = np.mgrid[:h, :w, :1]
+            mask = 1.0 - np.minimum(np.minimum(np.float32(x) / pad[0], np.float32(y) / pad[1]), np.minimum(np.float32(w-1-x) / pad[2], np.float32(h-1-y) / pad[3]))
+            blur = basesize * 0.02 / zoom
+            img += (scipy.ndimage.gaussian_filter(img, [blur, blur, 0]) - img) * np.clip(mask * 3.0 + 1.0, 0.0, 1.0)
+            img += (np.median(img, axis=(0,1)) - img) * np.clip(mask, 0.0, 1.0)
+            img = PIL.Image.fromarray(np.uint8(np.clip(np.round(img), 0, 255)), 'RGB')
+            quad += pad[0:2]
+
+        # Transform.
+        img = img.transform((basesize * 4, basesize * 4), PIL.Image.QUAD, (quad + 0.5).flatten(), PIL.Image.BILINEAR)
+        img = img.resize((basesize, basesize), PIL.Image.ANTIALIAS)
+        img = np.asarray(img).transpose(2, 0, 1)
+
+        return idx, img, superres
+
+    with ThreadPool(num_threads) as pool:
+        print '%d / %d' % (0, len(files))
+        for idx, img, superres in pool.process_items_concurrently(xrange(len(files)), process_func=process_func, max_items_in_flight=num_tasks):
+            if img is not None:
+                img = img.transpose(1, 2, 0)
+                img = PIL.Image.fromarray(np.uint8(np.clip(np.round(img), 0, 255)), 'RGB')
+                nx_dir = '1x' if superres <= 1 else '2x' if superres == 2 else '4x' if superres == 4 else '8x'
+                img.save(os.path.join(dataset_dir, out_dir, nx_dir, os.path.basename(files[idx])))
+                print 'Process file %s: %d / %d' % (files[idx], idx + 1, len(files))
+            else:
+                print 'Skip file %s: %d / %d' % (files[idx], idx + 1, len(files))
+
+    print 'Added %d images.' % len(files)
+
+#----------------------------------------------------------------------------
+
 def execute_cmdline(argv):
     prog = argv[0]
     parser = argparse.ArgumentParser(
@@ -697,6 +818,17 @@ def execute_cmdline(argv):
     p.add_argument(     'celeba_dir',       help='Directory to read CelebA data from')
     p.add_argument(     'delta_dir',        help='Directory to read CelebA-HQ deltas from')
     p.add_argument(     '--num_threads',    help='Number of concurrent threads (default: 4)', type=int, default=4)
+    p.add_argument(     '--num_tasks',      help='Number of concurrent processing tasks (default: 100)', type=int, default=100)
+
+    p = add_command(    'create_dataset', 'Create dataset for Megaface',
+                                            'create_dataset ~/dataset')
+    p.add_argument(     'dataset_dir',     help='Directory to read Megaface data from')
+    p.add_argument(     'model',            help='Classifying pytorch model')
+    p.add_argument(     'images_dir',       help='Directory in dataset_dir where images are located')
+    p.add_argument(     'landmarks_txt',    help='List with eyes, nose and mouth points')
+    p.add_argument(     'out_dir',          help='Directory with output images')
+    p.add_argument(     '--num_gpu',        help='Number of GPU (default: 0)', type=int, default=0)
+    p.add_argument(     '--num_threads',    help='Number of concurrent threads (default: 8)', type=int, default=8)
     p.add_argument(     '--num_tasks',      help='Number of concurrent processing tasks (default: 100)', type=int, default=100)
 
     args = parser.parse_args(argv[1:])
