@@ -1,0 +1,3 @@
+[submodule "lapsrn"]
+	path = lapsrn
+	url = git@github.com:joker512/pytorch-LapSRN.git
